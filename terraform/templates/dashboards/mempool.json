@@ -15,7 +15,6 @@
   "editable": true,
   "gnetId": null,
   "graphTooltip": 1,
-  "id": 4,
   "links": [],
   "panels": [
     {
@@ -39,7 +38,7 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 0,
         "y": 1
@@ -127,7 +126,7 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 8,
         "y": 1
@@ -157,10 +156,10 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(mempool{op=~\"insert..*\"}[1m])\n",
+	  "expr": "label_replace(irate(mempool{op=~'insert..*'}[1m]), 'status', '$1', 'op', '.*code: (.*?),.*')",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{peer_id}}:{{op}}",
+          "legendFormat": "{{peer_id}}: {{status}}",
           "refId": "A"
         }
       ],
@@ -211,7 +210,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 8
+        "y": 9
       },
       "id": 20,
       "panels": [],
@@ -225,10 +224,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 0,
-        "y": 9
+        "y": 10
       },
       "id": 10,
       "legend": {
@@ -311,10 +310,10 @@
       "description": "",
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 8,
-        "y": 9
+        "y": 10
       },
       "id": 12,
       "legend": {
@@ -396,10 +395,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 16,
-        "y": 9
+        "y": 10
       },
       "id": 14,
       "legend": {
@@ -481,10 +480,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 0,
-        "y": 16
+        "y": 18
       },
       "id": 8,
       "legend": {
@@ -567,10 +566,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 8,
-        "y": 16
+        "y": 18
       },
       "id": 6,
       "legend": {
@@ -651,7 +650,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 23
+        "y": 26
       },
       "id": 22,
       "panels": [],
@@ -665,10 +664,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 0,
-        "y": 24
+        "y": 27
       },
       "id": 24,
       "legend": {
@@ -750,10 +749,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 8,
-        "y": 24
+        "y": 27
       },
       "id": 26,
       "legend": {
@@ -779,11 +778,11 @@
       "stack": false,
       "steppedLine": false,
       "targets": [
-        {
-          "expr": "irate(mempool{op=~\"smp.event.*\"}[1m])",
+          {
+	      "expr": "label_replace(irate(mempool{op=~'smp.event.*'}[1m]), 'event', '$1', 'op', 'smp.event.(.*)')",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{peer_id}}",
+          "legendFormat": "{{peer_id}}: {{event}}",
           "refId": "A"
         }
       ],
@@ -791,7 +790,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "incoming events per sec",
+      "title": "Incoming events per sec",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -835,10 +834,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 16,
-        "y": 24
+        "y": 27
       },
       "id": 28,
       "legend": {
@@ -864,11 +863,11 @@
       "stack": false,
       "steppedLine": false,
       "targets": [
-        {
-          "expr": "irate(mempool{op=~\"smp.transactions.received.*\"}[1m])",
+          {
+	      "expr": "label_replace(irate(mempool{op=~'smp.transactions.received.*'}[1m]), 'sender', '$1', 'op', 'smp.transactions.received.(.{8}).*')",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{peer_id}}",
+          "legendFormat": "{{peer_id}} <- {{sender}}",
           "refId": "A"
         }
       ],
@@ -876,7 +875,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "new transactions received per sec",
+      "title": "New transactions received per sec",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -920,10 +919,10 @@
       "dashes": false,
       "fill": 1,
       "gridPos": {
-        "h": 7,
+        "h": 8,
         "w": 8,
         "x": 0,
-        "y": 31
+        "y": 35
       },
       "id": 30,
       "legend": {
@@ -950,10 +949,10 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(mempool{op=~'smp.smp.transactions.success.*'}[1m])",
+	    "expr": "label_replace(irate(mempool{op=~'smp.transactions.success.*'}[1m]), 'sender', '$1', 'op', 'smp.transactions.success.(.{8}).*')",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{peer_id}}",
+          "legendFormat": "{{peer_id}} <- {{sender}}",
           "refId": "A"
         }
       ],
@@ -961,7 +960,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "successful transactions per sec",
+      "title": "Successful transaction sync per sec",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -1006,7 +1005,7 @@
     "list": []
   },
   "time": {
-    "from": "now-5m",
+    "from": "now-3h",
     "to": "now"
   },
   "timepicker": {
@@ -1036,6 +1035,6 @@
   },
   "timezone": "",
   "title": "Mempool",
-  "uid": "jiPCqF7Zz",
-  "version": 5
+  "uid": "mempool",
+  "version": 1
 }

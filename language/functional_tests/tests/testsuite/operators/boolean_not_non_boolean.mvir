@@ -4,5 +4,4 @@ main() {
     return;
 }
 
-// check: VerificationError
-// check: BooleanOpTypeMismatchError
+// check: BOOLEAN_OP_TYPE_MISMATCH_ERROR

@@ -1,11 +1,10 @@
 import 0x0.LibraCoin;
 
 main() {
-    let z: R#LibraCoin.T;
+    let z: LibraCoin.T;
     z = LibraCoin.zero();
     z = LibraCoin.zero();
     return;
 }
 
-// check: VerificationError
-// check: StLocUnsafeToDestroyError
+// check: STLOC_UNSAFE_TO_DESTROY_ERROR

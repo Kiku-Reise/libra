@@ -1,15 +1,16 @@
-// check: no struct definition referencing in scripts
+// check: Missing struct definition for T
 
-modules:
 module Token {
-    resource T { }
-    public new(): R#Self.T {
-        return T{ };
+    resource T { b: bool }
+    public new(): Self.T {
+        return T{ b: true };
     }
 }
 
-script:
-import Transaction.Token;
+//! new-transaction
+
+import {{default}}.Token;
+
 main() {
     let sender: address;
     let yes: bool;

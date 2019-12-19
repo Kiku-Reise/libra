@@ -1,164 +1,98 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::state_replication::StateComputer;
 use crate::{
     chained_bft::{
-        chained_bft_smr::ChainedBftSMR, network::ConsensusNetworkImpl,
-        persistent_storage::PersistentStorage,
+        chained_bft_smr::{ChainedBftSMR, ChainedBftSMRConfig},
+        persistent_storage::{PersistentStorage, StorageWriteProxy},
     },
     consensus_provider::ConsensusProvider,
     state_computer::ExecutionProxy,
     state_replication::StateMachineReplication,
     txn_manager::MempoolProxy,
 };
+use anyhow::Result;
+use executor::Executor;
+use libra_config::config::NodeConfig;
+use libra_logger::prelude::*;
+use libra_mempool::proto::mempool_client::MempoolClientWrapper;
+use libra_types::transaction::SignedTransaction;
 use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
-
-use crate::{
-    chained_bft::{
-        chained_bft_smr::ChainedBftSMRConfig, common::Author, persistent_storage::StorageWriteProxy,
-    },
-    state_synchronizer::{setup_state_synchronizer, StateSynchronizer},
-};
-use config::config::{ConsensusProposerType::FixedProposer, NodeConfig};
-use execution_proto::proto::execution_grpc::ExecutionClient;
-use failure::prelude::*;
-use logger::prelude::*;
-use mempool::proto::mempool_grpc::MempoolClient;
-use std::{convert::TryFrom, sync::Arc};
+use safety_rules::SafetyRulesManagerConfig;
+use state_synchronizer::StateSyncClient;
+use std::sync::Arc;
 use tokio::runtime;
-use types::{
-    account_address::AccountAddress, transaction::SignedTransaction,
-    validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier,
-};
+use vm_runtime::LibraVM;
 
-struct InitialSetup {
-    author: Author,
-    signer: ValidatorSigner,
-    quorum_size: usize,
-    peers: Arc<Vec<Author>>,
-    validator: Arc<ValidatorVerifier>,
+///  The state necessary to begin state machine replication including ValidatorSet, networking etc.
+pub struct InitialSetup {
+    pub network_sender: ConsensusNetworkSender,
+    pub network_events: ConsensusNetworkEvents,
+    pub safety_rules_manager_config: Option<SafetyRulesManagerConfig>,
 }
 
 /// Supports the implementation of ConsensusProvider using LibraBFT.
 pub struct ChainedBftProvider {
-    smr: ChainedBftSMR<Vec<SignedTransaction>, Author>,
-    mempool_client: Arc<MempoolClient>,
-    execution_client: Arc<ExecutionClient>,
-    synchronizer_client: Arc<StateSynchronizer>,
+    smr: ChainedBftSMR<Vec<SignedTransaction>>,
+    txn_manager: MempoolProxy,
+    state_computer: Arc<dyn StateComputer<Payload = Vec<SignedTransaction>>>,
 }
 
 impl ChainedBftProvider {
     pub fn new(
-        node_config: &NodeConfig,
+        node_config: &mut NodeConfig,
         network_sender: ConsensusNetworkSender,
         network_events: ConsensusNetworkEvents,
-        mempool_client: Arc<MempoolClient>,
-        execution_client: Arc<ExecutionClient>,
+        executor: Arc<Executor<LibraVM>>,
+        synchronizer_client: Arc<StateSyncClient>,
     ) -> Self {
         let runtime = runtime::Builder::new()
-            .name_prefix("consensus-")
+            .thread_name("consensus-")
+            .threaded_scheduler()
+            .enable_all()
             .build()
             .expect("Failed to create Tokio runtime!");
 
-        let initial_setup = Self::initialize_setup(node_config);
-        let network = ConsensusNetworkImpl::new(
-            initial_setup.author,
-            network_sender.clone(),
-            network_events,
-            Arc::clone(&initial_setup.peers),
-            Arc::clone(&initial_setup.validator),
-        );
-        let synchronizer =
-            setup_state_synchronizer(network_sender, runtime.executor(), node_config);
-        let proposer = {
-            if node_config.consensus.get_proposer_type() == FixedProposer {
-                vec![Self::choose_leader(&initial_setup)]
-            } else {
-                initial_setup.validator.get_ordered_account_addresses()
-            }
-        };
-        debug!("[Consensus] My peer: {:?}", initial_setup.author);
-        debug!("[Consensus] Chosen proposer: {:?}", proposer);
-        let config = ChainedBftSMRConfig::from_node_config(&node_config.consensus);
-        let (storage, initial_data) = StorageWriteProxy::start(node_config);
-        info!(
-            "Starting up the consensus state machine with recovery data - {:?}, {:?}",
-            initial_data.state(),
-            initial_data.highest_timeout_certificates()
-        );
-        let smr = ChainedBftSMR::new(
-            initial_setup.author,
-            initial_setup.quorum_size,
-            initial_setup.signer,
-            proposer,
-            network,
-            runtime,
-            config,
-            storage,
-            initial_data,
-        );
+        let initial_setup = Self::initialize_setup(network_sender, network_events, node_config);
+        let config = ChainedBftSMRConfig::from_node_config(&node_config);
+        debug!("[Consensus] My peer: {:?}", config.author);
+        let storage = Arc::new(StorageWriteProxy::new(node_config));
+        let initial_data = storage.start();
+
+        let mempool_client =
+            MempoolClientWrapper::new("localhost", node_config.mempool.mempool_service_port);
+        let txn_manager = MempoolProxy::new(mempool_client);
+
+        let state_computer = Arc::new(ExecutionProxy::new(executor, synchronizer_client.clone()));
+        let smr = ChainedBftSMR::new(initial_setup, runtime, config, storage, initial_data);
         Self {
             smr,
-            mempool_client,
-            execution_client,
-            synchronizer_client: Arc::new(synchronizer),
+            txn_manager,
+            state_computer,
         }
     }
 
     /// Retrieve the initial "state" for consensus. This function is synchronous and returns after
     /// reading the local persistent store and retrieving the initial state from the executor.
-    fn initialize_setup(node_config: &NodeConfig) -> InitialSetup {
-        // Keeping the initial set of validators in a node config is embarrassing and we should
-        // all feel bad about it.
-        let peer_id_str = node_config.base.peer_id.clone();
-        let author =
-            AccountAddress::try_from(peer_id_str).expect("Failed to parse peer id of a validator");
-        let private_key = node_config.base.peer_keypairs.get_consensus_private();
-        let public_key = node_config.base.peer_keypairs.get_consensus_public();
-        let signer = ValidatorSigner::new(author, public_key, private_key);
-        let peers_with_public_keys = node_config.base.trusted_peers.get_trusted_consensus_peers();
-        let peers = Arc::new(
-            peers_with_public_keys
-                .keys()
-                .map(AccountAddress::clone)
-                .collect(),
-        );
-        let quorum_size = peers_with_public_keys.len() * 2 / 3 + 1;
-        let validator = Arc::new(ValidatorVerifier::new(
-            peers_with_public_keys.clone(),
-            quorum_size,
-        ));
-        debug!("[Consensus]: quorum_size = {:?}", quorum_size);
+    fn initialize_setup(
+        network_sender: ConsensusNetworkSender,
+        network_events: ConsensusNetworkEvents,
+        node_config: &mut NodeConfig,
+    ) -> InitialSetup {
         InitialSetup {
-            author,
-            signer,
-            quorum_size,
-            peers,
-            validator,
+            network_sender,
+            network_events,
+            safety_rules_manager_config: Some(SafetyRulesManagerConfig::new(node_config)),
         }
-    }
-
-    /// Choose a proposer that is going to be the single leader (relevant for a mock fixed proposer
-    /// election only).
-    fn choose_leader(initial_setup: &InitialSetup) -> Author {
-        // As it is just a tmp hack function, pick the smallest PeerId to be a proposer.
-        *initial_setup
-            .peers
-            .iter()
-            .max()
-            .expect("No trusted peers found!")
     }
 }
 
 impl ConsensusProvider for ChainedBftProvider {
     fn start(&mut self) -> Result<()> {
-        let txn_manager = Arc::new(MempoolProxy::new(self.mempool_client.clone()));
-        let state_computer = Arc::new(ExecutionProxy::new(
-            self.execution_client.clone(),
-            self.synchronizer_client.clone(),
-        ));
         debug!("Starting consensus provider.");
-        self.smr.start(txn_manager, state_computer)
+        self.smr
+            .start(self.txn_manager.clone(), Arc::clone(&self.state_computer))
     }
 
     fn stop(&mut self) {

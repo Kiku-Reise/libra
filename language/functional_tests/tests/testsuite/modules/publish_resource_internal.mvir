@@ -1,18 +1,19 @@
-// check: no struct definition referencing in scripts
+// check: Missing struct definition for Token
 
-modules:
 module Token {
-    resource T { }
-    public new(): R#Self.T {
-        return T{ };
+    resource T { b: bool }
+    public new(): Self.T {
+        return T{ b: true };
     }
 }
 
-script:
-import Transaction.Token;
+//! new-transaction
+
+import {{default}}.Token;
+
 main() {
     let addr1: address;
-    let t: R#Token.T;
+    let t: Token.T;
     addr1 = get_txn_sender();
     t = Token.new();
     move_to_sender<Token>(move(t));

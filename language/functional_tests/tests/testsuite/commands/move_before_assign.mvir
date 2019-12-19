@@ -5,5 +5,4 @@ main() {
     return;
 }
 
-// check: VerificationError
-// check: MoveLocUnavailableError
+// check: MOVELOC_UNAVAILABLE_ERROR

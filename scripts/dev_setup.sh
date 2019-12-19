@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) The Libra Core Contributors
+# SPDX-License-Identifier: Apache-2.0
 # This script sets up the environment for the Libra build by installing necessary dependencies.
 #
 # Usage ./dev_setup.sh <options>
@@ -25,9 +27,10 @@ if [[ "$OSTYPE" == "linux-gnu" ]]; then
 		PACKAGE_MANAGER="yum"
 	elif which apt-get &>/dev/null; then
 		PACKAGE_MANAGER="apt-get"
-		sudo apt-get update
+	elif which pacman &>/dev/null; then
+		PACKAGE_MANAGER="pacman"
 	else
-		echo "Unable to find supported package manager (yum or apt-get). Abort"
+		echo "Unable to find supported package manager (yum, apt-get, or pacman). Abort"
 		exit 1
 	fi
 elif [[ "$OSTYPE" == "darwin"* ]]; then
@@ -48,14 +51,14 @@ Welcome to Libra!
 This script will download and install the necessary dependencies needed to
 build Libra Core. This includes:
 	* Rust (and the necessary components, e.g. rust-fmt, clippy)
-	* CMake, protobuf, go (for building protobuf)
+	* CMake, protobuf
 
 If you'd prefer to install these dependencies yourself, please exit this script
 now with Ctrl-C.
 
 EOF
 
-printf "Proceed with installing necessary dependencies? (y) > "
+printf "Proceed with installing necessary dependencies? (y/N) > "
 read -e input
 if [[ "$input" != "y"* ]]; then
 	echo "Exiting..."
@@ -79,29 +82,23 @@ rustup update
 rustup component add rustfmt
 rustup component add clippy
 
-echo "Installing CMake......"
-if which cmake &>/dev/null; then
-  echo "CMake is already installed"
-else
-	if [[ "$PACKAGE_MANAGER" == "yum" ]]; then
-		sudo yum install cmake
-	elif [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-		sudo apt-get install cmake
-	elif [[ "$PACKAGE_MANAGER" == "brew" ]]; then
-		brew install cmake
-	fi
+if [[ $"$PACKAGE_MANAGER" == "apt-get" ]]; then
+	echo "Updating apt-get......"
+	sudo apt-get update
 fi
 
-echo "Installing Go......"
-if which go &>/dev/null; then
-  echo "Go is already installed"
+echo "Installing CMake......"
+if which cmake &>/dev/null; then
+	echo "CMake is already installed"
 else
 	if [[ "$PACKAGE_MANAGER" == "yum" ]]; then
-		sudo yum install golang
+		sudo yum install cmake -y
 	elif [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-		sudo apt-get install golang
+		sudo apt-get install cmake -y
+	elif [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
+		sudo pacman -Syu cmake --noconfirm
 	elif [[ "$PACKAGE_MANAGER" == "brew" ]]; then
-		brew install go
+		brew install cmake
 	fi
 fi
 
@@ -109,23 +106,26 @@ echo "Installing Protobuf......"
 if which protoc &>/dev/null; then
   echo "Protobuf is already installed"
 else
-	if [[ "$PACKAGE_MANAGER" == "yum" ]]; then
-		sudo yum install protobuf
-	elif [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
-		sudo apt-get install protobuf-compiler
-	elif [[ "$PACKAGE_MANAGER" == "brew" ]]; then
+	if [[ "$OSTYPE" == "linux-gnu" ]]; then
+		if ! which unzip &>/dev/null; then
+			echo "Installing unzip......"
+			if [[ "$PACKAGE_MANAGER" == "yum" ]]; then
+				sudo yum install unzip -y
+			elif [[ "$PACKAGE_MANAGER" == "apt-get" ]]; then
+				sudo apt-get install unzip -y
+			elif [[ "$PACKAGE_MANAGER" == "pacman" ]]; then
+				sudo pacman -Syu unzip --noconfirm
+			fi
+		fi
+		PROTOC_VERSION=3.8.0
+		PROTOC_ZIP=protoc-$PROTOC_VERSION-linux-x86_64.zip
+		curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP
+		sudo unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
+		sudo unzip -o $PROTOC_ZIP -d /usr/local include/*
+		rm -f $PROTOC_ZIP
+		echo "protoc is installed to /usr/local/bin/"
+	else
 		brew install protobuf
-	fi
-fi
-
-if [[ -f /etc/debian_version ]]; then
-	PROTOC_VERSION=`protoc --version | cut -d" " -f2`
-	REQUIRED_PROTOC_VERSION="3.6.0"
-	PROTOC_VERSION_CHECK=`dpkg --compare-versions $REQUIRED_PROTOC_VERSION "gt" $PROTOC_VERSION`
-
-	if [ $? -eq "0" ]; then
-		echo "protoc version is too old. Update protoc to 3.6.0 or above. Abort"
-		exit 1
 	fi
 fi
 

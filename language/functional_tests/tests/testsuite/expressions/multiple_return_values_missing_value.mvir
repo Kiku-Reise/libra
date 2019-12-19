@@ -1,37 +1,18 @@
-// check: VerificationError { kind: FunctionDefinition, idx: 1, err: NegativeStackSizeInsideBlock(0, 3) }
-
-modules:
 module Test {
-    resource T { }
+    resource T { b: bool }
 
-    public new(): R#Self.T {
-        return T { };
+    public new(): Self.T {
+        return T { b: true };
     }
 
-    public test(i: &u64, x: R#Self.T): u64 * R#Self.T * bool {
+    public test(i: &u64, x: Self.T): u64 * Self.T * bool {
         return *move(i), move(x);
     }
 
-    public destroy(x: R#Self.T) {
-        T { } = move(x);
+    public destroy(x: Self.T) {
+        let b: bool;
+        T { b } = move(x);
         return;
     }
 }
-script:
-import Transaction.Test;
-main() {
-    let i: u64;
-    let t: R#Test.T;
-    let a: u64;
-    let b: bool;
-    let x: R#Test.T;
-
-    i = 0;
-    t = Test.new();
-    a, x, b = Test.test(&i, move(t));
-    assert(move(a) == 0, 42);
-    Test.destroy(move(x));
-    assert(!move(b), 43);
-
-    return;
-}
+// check: NEGATIVE_STACK_SIZE_WITHIN_BLOCK

@@ -1,25 +1,20 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
-
+use anyhow::{ensure, Error, Result};
 use bech32::{Bech32, FromBase32, ToBase32};
-use bytes::Bytes;
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use crypto::{
-    hash::{AccountAddressHasher, CryptoHash, CryptoHasher},
-    HashValue, PublicKey,
-};
-use failure::prelude::*;
+use bytes05::Bytes;
 use hex;
+use libra_crypto::{
+    hash::{CryptoHash, CryptoHasher},
+    HashValue, VerifyingKey,
+};
+use libra_crypto_derive::CryptoHasher;
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
 use rand::{rngs::OsRng, Rng};
-use serde::{Deserialize, Serialize};
-use std::{convert::TryFrom, fmt};
-use tiny_keccak::Keccak;
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use std::{convert::TryFrom, fmt, str::FromStr};
 
 pub const ADDRESS_LENGTH: usize = 32;
 
@@ -29,13 +24,12 @@ const LIBRA_NETWORK_ID_SHORT: &str = "lb";
 
 /// A struct that represents an account address.
 /// Currently Public Key is used.
-#[derive(
-    Arbitrary, Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Serialize, Deserialize, Copy,
-)]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Copy, CryptoHasher)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccountAddress([u8; ADDRESS_LENGTH]);
 
 impl AccountAddress {
-    pub fn new(address: [u8; ADDRESS_LENGTH]) -> Self {
+    pub const fn new(address: [u8; ADDRESS_LENGTH]) -> Self {
         AccountAddress(address)
     }
 
@@ -52,6 +46,31 @@ impl AccountAddress {
 
     pub fn to_vec(&self) -> Vec<u8> {
         self.0.to_vec()
+    }
+
+    pub fn from_public_key<PublicKey: VerifyingKey>(public_key: &PublicKey) -> Self {
+        let hash = *HashValue::from_sha3_256(&public_key.to_bytes()).as_ref();
+        AccountAddress::new(hash)
+    }
+
+    pub fn from_hex_literal(literal: &str) -> Result<Self> {
+        let mut hex_string = String::from(&literal[2..]);
+        if hex_string.len() % 2 != 0 {
+            hex_string.insert(0, '0');
+        }
+
+        let mut result = hex::decode(hex_string.as_str())?;
+        let len = result.len();
+        if len < 32 {
+            result.reverse();
+            for _ in len..32 {
+                result.push(0);
+            }
+            result.reverse();
+        }
+
+        assert!(result.len() >= 32);
+        AccountAddress::try_from(result)
     }
 }
 
@@ -92,7 +111,7 @@ impl fmt::LowerHex for AccountAddress {
 }
 
 impl TryFrom<&[u8]> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     /// Tries to convert the provided byte array into Address.
     fn try_from(bytes: &[u8]) -> Result<AccountAddress> {
@@ -108,7 +127,7 @@ impl TryFrom<&[u8]> for AccountAddress {
 }
 
 impl TryFrom<&[u8; 32]> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     /// Tries to convert the provided byte array into Address.
     fn try_from(bytes: &[u8; 32]) -> Result<AccountAddress> {
@@ -117,7 +136,7 @@ impl TryFrom<&[u8; 32]> for AccountAddress {
 }
 
 impl TryFrom<Vec<u8>> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     /// Tries to convert the provided byte buffer into Address.
     fn try_from(bytes: Vec<u8>) -> Result<AccountAddress> {
@@ -138,7 +157,7 @@ impl From<&AccountAddress> for Vec<u8> {
 }
 
 impl TryFrom<Bytes> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     fn try_from(bytes: Bytes) -> Result<AccountAddress> {
         AccountAddress::try_from(bytes.as_ref())
@@ -147,36 +166,7 @@ impl TryFrom<Bytes> for AccountAddress {
 
 impl From<AccountAddress> for Bytes {
     fn from(addr: AccountAddress) -> Bytes {
-        addr.0.as_ref().into()
-    }
-}
-
-impl FromProto for AccountAddress {
-    type ProtoType = Vec<u8>;
-
-    fn from_proto(addr: Self::ProtoType) -> Result<Self> {
-        AccountAddress::try_from(&addr[..])
-    }
-}
-
-impl IntoProto for AccountAddress {
-    type ProtoType = Vec<u8>;
-
-    fn into_proto(self) -> Self::ProtoType {
-        self.0.to_vec()
-    }
-}
-
-impl From<PublicKey> for AccountAddress {
-    fn from(public_key: PublicKey) -> AccountAddress {
-        // TODO: using keccak directly instead of crypto::hash because we have to make sure we use
-        // the same hash function that the Move transaction prologue is using.
-        // TODO: keccak is just a placeholder, make a principled choose for the hash function
-        let mut keccak = Keccak::new_sha3_256();
-        let mut hash = [0u8; ADDRESS_LENGTH];
-        keccak.update(&public_key.to_slice());
-        keccak.finalize(&mut hash);
-        AccountAddress::new(hash)
+        Bytes::copy_from_slice(addr.0.as_ref())
     }
 }
 
@@ -187,7 +177,7 @@ impl From<&AccountAddress> for String {
 }
 
 impl TryFrom<String> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     fn try_from(s: String) -> Result<AccountAddress> {
         assert!(!s.is_empty());
@@ -197,7 +187,7 @@ impl TryFrom<String> for AccountAddress {
 }
 
 impl TryFrom<Bech32> for AccountAddress {
-    type Error = failure::Error;
+    type Error = Error;
 
     fn try_from(encoded_input: Bech32) -> Result<AccountAddress> {
         let base32_hash = encoded_input.data();
@@ -206,8 +196,18 @@ impl TryFrom<Bech32> for AccountAddress {
     }
 }
 
+impl FromStr for AccountAddress {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        assert!(!s.is_empty());
+        let bytes_out = ::hex::decode(s)?;
+        AccountAddress::try_from(bytes_out.as_slice())
+    }
+}
+
 impl TryFrom<AccountAddress> for Bech32 {
-    type Error = failure::Error;
+    type Error = Error;
 
     fn try_from(addr: AccountAddress) -> Result<Bech32> {
         let base32_hash = addr.0.to_base32();
@@ -215,16 +215,30 @@ impl TryFrom<AccountAddress> for Bech32 {
     }
 }
 
-impl CanonicalSerialize for AccountAddress {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer.encode_variable_length_bytes(&self.0)?;
-        Ok(())
+impl<'de> Deserialize<'de> for AccountAddress {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = <&str>::deserialize(deserializer)?;
+            AccountAddress::from_str(s).map_err(D::Error::custom)
+        } else {
+            let b = <[u8; ADDRESS_LENGTH]>::deserialize(deserializer)?;
+            Ok(AccountAddress::new(b))
+        }
     }
 }
 
-impl CanonicalDeserialize for AccountAddress {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let bytes = deserializer.decode_variable_length_bytes()?;
-        Self::try_from(bytes)
+impl Serialize for AccountAddress {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            self.to_string().serialize(serializer)
+        } else {
+            self.0.serialize(serializer)
+        }
     }
 }

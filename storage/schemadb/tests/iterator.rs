@@ -1,8 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use failure::Result;
 use schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec},
@@ -71,13 +71,13 @@ fn collect_values(iter: SchemaIterator<TestSchema>) -> Vec<u32> {
 }
 
 struct TestDB {
-    _tmpdir: tempfile::TempDir,
+    _tmpdir: libra_tools::tempdir::TempPath,
     db: DB,
 }
 
 impl TestDB {
     fn new() -> Self {
-        let tmpdir = tempfile::tempdir().expect("Failed to create temporary directory.");
+        let tmpdir = libra_tools::tempdir::TempPath::new();
         let cf_opts_map: ColumnFamilyOptionsMap = [
             (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
             (
@@ -88,7 +88,7 @@ impl TestDB {
         .iter()
         .cloned()
         .collect();
-        let db = DB::open(&tmpdir, cf_opts_map).unwrap();
+        let db = DB::open(&tmpdir.path(), cf_opts_map).unwrap();
 
         db.put::<TestSchema>(&TestKey(1, 0, 0), &TestValue(100))
             .unwrap();

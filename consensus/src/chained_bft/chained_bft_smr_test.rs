@@ -4,60 +4,70 @@
 use crate::{
     chained_bft::{
         block_storage::BlockReader,
+        chained_bft_consensus_provider::InitialSetup,
         chained_bft_smr::{ChainedBftSMR, ChainedBftSMRConfig},
-        common::Author,
-        liveness::proposer_election::ProposalInfo,
-        network::ConsensusNetworkImpl,
         network_tests::NetworkPlayground,
-        safety::vote_msg::VoteMsg,
-        test_utils::{MockStateComputer, MockStorage, MockTransactionManager, TestPayload},
+        persistent_storage::RecoveryData,
+        test_utils::{
+            consensus_runtime, with_smr_id, MockStateComputer, MockStorage, MockTransactionManager,
+            TestPayload,
+        },
     },
     state_replication::StateMachineReplication,
 };
 use channel;
-use crypto::hash::CryptoHash;
-use futures::{channel::mpsc, executor::block_on, prelude::*};
-use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
-use proto_conv::FromProto;
-use std::sync::Arc;
-use types::{validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier};
-
-use crate::chained_bft::{
-    persistent_storage::RecoveryData,
-    test_utils::{consensus_runtime, with_smr_id},
+use consensus_types::{
+    proposal_msg::{ProposalMsg, ProposalUncheckedSignatures},
+    vote_msg::VoteMsg,
 };
-use config::config::ConsensusProposerType::{self, FixedProposer, RotatingProposer};
-use std::{collections::HashMap, time::Duration};
+use futures::{channel::mpsc, executor::block_on, prelude::*};
+use libra_config::config::{
+    ConsensusProposerType::{self, FixedProposer, MultipleOrderedProposers, RotatingProposer},
+    SafetyRulesConfig,
+};
+use libra_crypto::hash::CryptoHash;
+use libra_types::{
+    crypto_proxies::ValidatorSet,
+    crypto_proxies::{
+        random_validator_verifier, LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorSigner,
+        ValidatorVerifier,
+    },
+};
+use network::{
+    proto::ConsensusMsg_oneof,
+    validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
+};
+use safety_rules::SafetyRulesManagerConfig;
+use std::{convert::TryFrom, path::PathBuf, sync::Arc, time::Duration};
+use tempfile::NamedTempFile;
 use tokio::runtime;
-use types::ledger_info::LedgerInfoWithSignatures;
 
 /// Auxiliary struct that is preparing SMR for the test
 struct SMRNode {
-    author: Author,
     signer: ValidatorSigner,
-    validator: Arc<ValidatorVerifier>,
-    peers: Arc<Vec<Author>>,
-    proposer: Vec<Author>,
+    validators: Arc<ValidatorVerifier>,
+    proposer_type: ConsensusProposerType,
     smr_id: usize,
-    smr: ChainedBftSMR<TestPayload, Author>,
+    smr: ChainedBftSMR<TestPayload>,
     commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures>,
-    mempool: Arc<MockTransactionManager>,
+    mempool: MockTransactionManager,
     mempool_notif_receiver: mpsc::Receiver<usize>,
     storage: Arc<MockStorage<TestPayload>>,
+    safety_rules_path: PathBuf,
 }
 
 impl SMRNode {
     fn start(
-        quorum_size: usize,
         playground: &mut NetworkPlayground,
         signer: ValidatorSigner,
-        validator: Arc<ValidatorVerifier>,
-        peers: Arc<Vec<Author>>,
-        proposer: Vec<Author>,
         smr_id: usize,
         storage: Arc<MockStorage<TestPayload>>,
         initial_data: RecoveryData<TestPayload>,
+        proposer_type: ConsensusProposerType,
+        executor_with_reconfig: Option<ValidatorSet>,
+        safety_rules_path: PathBuf,
     ) -> Self {
+        let validators = initial_data.validators();
         let author = signer.author();
 
         let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
@@ -67,122 +77,107 @@ impl SMRNode {
 
         playground.add_node(author, consensus_tx, network_reqs_rx);
         let runtime = runtime::Builder::new()
-            .after_start(with_smr_id(signer.author().short_str()))
+            .threaded_scheduler()
+            .enable_all()
+            .on_thread_start(with_smr_id(signer.author().short_str()))
             .build()
             .expect("Failed to create Tokio runtime!");
-        let network = ConsensusNetworkImpl::new(
-            author,
-            network_sender,
-            network_events,
-            Arc::clone(&peers),
-            Arc::clone(&validator),
-        );
 
         let config = ChainedBftSMRConfig {
             max_pruned_blocks_in_mem: 10000,
-            pacemaker_initial_timeout: Duration::from_secs(1),
+            pacemaker_initial_timeout: Duration::from_secs(3),
+            proposer_type,
             contiguous_rounds: 2,
             max_block_size: 50,
+            author: signer.author(),
+        };
+
+        let safety_rules_manager_config = SafetyRulesManagerConfig::new_with_signer(
+            signer.clone(),
+            &SafetyRulesConfig::default(),
+        );
+        let initial_setup = InitialSetup {
+            network_sender,
+            network_events,
+            safety_rules_manager_config: Some(safety_rules_manager_config),
         };
         let mut smr = ChainedBftSMR::new(
-            author,
-            quorum_size,
-            signer.clone(),
-            proposer.clone(),
-            network,
+            initial_setup,
             runtime,
             config,
             storage.clone(),
             initial_data,
         );
         let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
-        let mut mp = MockTransactionManager::new();
-        let commit_receiver = mp.take_commit_receiver();
-        let mempool = Arc::new(mp);
+        let (mp, commit_receiver) = MockTransactionManager::new();
+        let mempool = mp;
         smr.start(
             mempool.clone(),
-            Arc::new(MockStateComputer::new(commit_cb_sender.clone())),
+            Arc::new(MockStateComputer::new(
+                commit_cb_sender.clone(),
+                Arc::clone(&storage),
+                executor_with_reconfig,
+            )),
         )
         .expect("Failed to start SMR!");
         Self {
-            author,
             signer,
-            validator,
-            peers,
-            proposer,
+            validators,
+            proposer_type,
             smr_id,
             smr,
             commit_cb_receiver,
             mempool,
             mempool_notif_receiver: commit_receiver,
             storage,
+            safety_rules_path,
         }
     }
 
-    fn restart(mut self, quorum_size: usize, playground: &mut NetworkPlayground) -> Self {
+    fn restart(mut self, playground: &mut NetworkPlayground) -> Self {
         self.smr.stop();
         let recover_data = self
             .storage
-            .get_recovery_data()
+            .try_start()
             .unwrap_or_else(|e| panic!("fail to restart due to: {}", e));
         Self::start(
-            quorum_size,
             playground,
             self.signer,
-            self.validator,
-            self.peers,
-            self.proposer,
             self.smr_id + 10,
             self.storage,
             recover_data,
+            self.proposer_type,
+            None,
+            self.safety_rules_path,
         )
     }
 
     fn start_num_nodes(
         num_nodes: usize,
-        quorum_size: usize,
         playground: &mut NetworkPlayground,
         proposer_type: ConsensusProposerType,
+        executor_with_reconfig: bool,
     ) -> Vec<Self> {
-        let mut signers = vec![];
-        let mut author_to_public_keys = HashMap::new();
-        for smr_id in 0..num_nodes {
-            // 0 -> [0000], 1 -> [1000] in the logs
-            let random_validator_signer = ValidatorSigner::from_int(smr_id as u8);
-            author_to_public_keys.insert(
-                random_validator_signer.author(),
-                random_validator_signer.public_key(),
-            );
-            signers.push(random_validator_signer);
-        }
-        let validator_verifier =
-            Arc::new(ValidatorVerifier::new(author_to_public_keys, quorum_size));
-        let peers: Arc<Vec<Author>> = Arc::new(
-            signers
-                .clone()
-                .into_iter()
-                .map(|signer| signer.author())
-                .collect(),
-        );
-        let proposer = {
-            match proposer_type {
-                FixedProposer => vec![peers[0]],
-                RotatingProposer => validator_verifier.get_ordered_account_addresses(),
-            }
+        let (mut signers, validators) = random_validator_verifier(num_nodes, None, true);
+        let validator_set: ValidatorSet = (&validators).into();
+        let executor_validator_set = if executor_with_reconfig {
+            Some(validator_set.clone())
+        } else {
+            None
         };
         let mut nodes = vec![];
         for smr_id in 0..num_nodes {
-            let (storage, initial_data) = MockStorage::start_for_testing();
+            let (initial_data, storage) = MockStorage::start_for_testing(validator_set.clone());
+            let safety_rules_path = NamedTempFile::new().unwrap().into_temp_path().to_path_buf();
             nodes.push(Self::start(
-                quorum_size,
                 playground,
                 signers.remove(0),
-                Arc::clone(&validator_verifier),
-                Arc::clone(&peers),
-                proposer.clone(),
                 smr_id,
                 storage,
                 initial_data,
+                proposer_type,
+                executor_validator_set.clone(),
+                safety_rules_path,
             ));
         }
         nodes
@@ -194,8 +189,8 @@ fn verify_finality_proof(node: &SMRNode, ledger_info_with_sig: &LedgerInfoWithSi
     for (author, signature) in ledger_info_with_sig.signatures() {
         assert_eq!(
             Ok(()),
-            node.validator
-                .verify_signature(*author, ledger_info_hash, signature)
+            node.validators
+                .verify_signature(*author, ledger_info_hash, &signature)
         );
     }
 }
@@ -204,23 +199,28 @@ fn verify_finality_proof(node: &SMRNode, ledger_info_with_sig: &LedgerInfoWithSi
 /// Should receive a new proposal upon start
 fn basic_start_test() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
-    let nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer);
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let nodes = SMRNode::start_num_nodes(2, &mut playground, RotatingProposer, false);
     let genesis = nodes[0]
         .smr
         .block_store()
         .expect("No valid block store!")
         .root();
     block_on(async move {
-        let mut msg = playground
+        let msg = playground
             .wait_for_messages(1, NetworkPlayground::proposals_only)
             .await;
-        let first_proposal =
-            ProposalInfo::<Vec<u64>, Author>::from_proto(msg[0].1.take_proposal()).unwrap();
-        assert_eq!(first_proposal.proposal.height(), 1);
-        assert_eq!(first_proposal.proposal.parent_id(), genesis.id());
+        let first_proposal: ProposalMsg<Vec<u64>> =
+            ProposalUncheckedSignatures::<Vec<u64>>::try_from(msg[0].1.clone())
+                .unwrap()
+                .into();
+        assert_eq!(first_proposal.proposal().parent_id(), genesis.id());
         assert_eq!(
-            first_proposal.proposal.quorum_cert().certified_block_id(),
+            first_proposal
+                .proposal()
+                .quorum_cert()
+                .certified_block()
+                .id(),
             genesis.id()
         );
     });
@@ -230,8 +230,8 @@ fn basic_start_test() {
 /// Upon startup, the first proposal is sent, delivered and voted by all the participants.
 fn start_with_proposal_test() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
-    let nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer);
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let nodes = SMRNode::start_num_nodes(2, &mut playground, RotatingProposer, false);
 
     block_on(async move {
         let _proposals = playground
@@ -242,9 +242,9 @@ fn start_with_proposal_test() {
             .wait_for_messages(2, NetworkPlayground::votes_only)
             .await
             .into_iter()
-            .map(|(_, mut msg)| VoteMsg::from_proto(msg.take_vote()).unwrap())
+            .map(|(_, msg)| VoteMsg::try_from(msg).unwrap())
             .collect();
-        let proposed_block_id = votes[0].proposed_block_id();
+        let proposed_block_id = votes[0].vote().vote_data().proposed().id();
 
         // Verify that the proposed block id is indeed present in the block store.
         assert!(nodes[0]
@@ -262,31 +262,46 @@ fn start_with_proposal_test() {
     });
 }
 
+fn basic_full_round(num_nodes: usize, proposer_type: ConsensusProposerType) {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let _nodes = SMRNode::start_num_nodes(num_nodes, &mut playground, proposer_type, false);
+
+    // In case we're using multi-proposer, every proposal and vote is sent to two participants.
+    let num_messages_to_send = if proposer_type == MultipleOrderedProposers {
+        2 * (num_nodes - 1)
+    } else {
+        num_nodes - 1
+    };
+    block_on(async move {
+        let _broadcast_proposals_1 = playground
+            .wait_for_messages(num_messages_to_send, NetworkPlayground::proposals_only)
+            .await;
+        let _votes_1 = playground
+            .wait_for_messages(num_messages_to_send, NetworkPlayground::votes_only)
+            .await;
+        let broadcast_proposals_2 = playground
+            .wait_for_messages(num_messages_to_send, NetworkPlayground::proposals_only)
+            .await;
+        let next_proposal: ProposalMsg<Vec<u64>> =
+            ProposalUncheckedSignatures::<Vec<u64>>::try_from(broadcast_proposals_2[0].1.clone())
+                .unwrap()
+                .into();
+        assert!(next_proposal.proposal().round() >= 2);
+    });
+}
+
 #[test]
 /// Upon startup, the first proposal is sent, voted by all the participants, QC is formed and
 /// then the next proposal is sent.
-fn basic_full_round() {
-    let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
-    let _nodes = SMRNode::start_num_nodes(2, 2, &mut playground, FixedProposer);
+fn basic_full_round_test() {
+    basic_full_round(2, FixedProposer);
+}
 
-    block_on(async move {
-        let _broadcast_proposals_1 = playground
-            .wait_for_messages(1, NetworkPlayground::proposals_only)
-            .await;
-        let _votes_1 = playground
-            .wait_for_messages(1, NetworkPlayground::votes_only)
-            .await;
-        let mut broadcast_proposals_2 = playground
-            .wait_for_messages(1, NetworkPlayground::proposals_only)
-            .await;
-        let next_proposal = ProposalInfo::<Vec<u64>, Author>::from_proto(
-            broadcast_proposals_2[0].1.take_proposal(),
-        )
-        .unwrap();
-        assert_eq!(next_proposal.proposal.round(), 2);
-        assert_eq!(next_proposal.proposal.height(), 2);
-    });
+#[test]
+/// Basic happy path with multiple proposers
+fn happy_path_with_multi_proposer() {
+    basic_full_round(2, MultipleOrderedProposers);
 }
 
 /// Verify the basic e2e flow: blocks are committed, txn manager is notified, block tree is
@@ -294,8 +309,8 @@ fn basic_full_round() {
 #[test]
 fn basic_commit_and_restart() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
-    let mut nodes = SMRNode::start_num_nodes(2, 2, &mut playground, RotatingProposer);
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let mut nodes = SMRNode::start_num_nodes(2, &mut playground, RotatingProposer, false);
     let mut block_ids = vec![];
 
     block_on(async {
@@ -303,7 +318,7 @@ fn basic_commit_and_restart() {
 
         for round in 0..num_rounds {
             let _proposals = playground
-                .wait_for_messages(1, NetworkPlayground::exclude_new_round)
+                .wait_for_messages(1, NetworkPlayground::exclude_timeout_msg)
                 .await;
 
             // A proposal is carrying a QC that commits a block of round - 3.
@@ -324,33 +339,35 @@ fn basic_commit_and_restart() {
             }
 
             // v1 and v2 send votes
-            let mut votes = playground
+            let votes = playground
                 .wait_for_messages(1, NetworkPlayground::votes_only)
                 .await;
-            let vote_msg = VoteMsg::from_proto(votes[0].1.take_vote()).unwrap();
-            block_ids.push(vote_msg.proposed_block_id());
+            let vote_msg = VoteMsg::try_from(votes[0].1.clone()).unwrap();
+            block_ids.push(vote_msg.vote().vote_data().proposed().id());
         }
+
         assert!(
-            nodes[0].smr.block_store().unwrap().root().height() >= 6,
-            "height of node 0 is {}",
-            nodes[0].smr.block_store().unwrap().root().height()
+            nodes[0].smr.block_store().unwrap().root().round() >= 7,
+            "round of node 0 is {}",
+            nodes[0].smr.block_store().unwrap().root().round()
         );
         assert!(
-            nodes[1].smr.block_store().unwrap().root().height() >= 6,
-            "height of node 1 is {}",
-            nodes[1].smr.block_store().unwrap().root().height()
+            nodes[1].smr.block_store().unwrap().root().round() >= 7,
+            "round of node 1 is {}",
+            nodes[1].smr.block_store().unwrap().root().round()
         );
+
         // This message is for proposal with round 11 to delivery the QC, but not gather the QC
         // so after restart, proposer will propose round 11 again.
         playground
-            .wait_for_messages(1, NetworkPlayground::exclude_new_round)
+            .wait_for_messages(1, NetworkPlayground::exclude_timeout_msg)
             .await;
     });
     // create a new playground to avoid polling potential vote messages in previous one.
-    playground = NetworkPlayground::new(runtime.executor());
+    playground = NetworkPlayground::new(runtime.handle().clone());
     nodes = nodes
         .into_iter()
-        .map(|node| node.restart(2, &mut playground))
+        .map(|node| node.restart(&mut playground))
         .collect();
 
     block_on(async {
@@ -362,27 +379,28 @@ fn basic_commit_and_restart() {
             // reject round 11 depends on whether it voted for before restart.
             loop {
                 let msg = playground
-                    .wait_for_messages(1, NetworkPlayground::exclude_new_round)
+                    .wait_for_messages(1, NetworkPlayground::exclude_timeout_msg)
                     .await;
-                if msg[0].1.has_vote() {
+                if let Some(ConsensusMsg_oneof::VoteMsg(_)) = msg[0].1.message {
                     round += 1;
                     break;
                 }
             }
         }
+
         // Because of the race, we can't assert the commit reliably, instead we assert
         // both nodes commit to at least round 17.
         // We cannot reliable wait for the event of "commit & prune": the only thing that we know is
         // that after receiving the vote for round 20, the root should be at least height 16.
         assert!(
-            nodes[0].smr.block_store().unwrap().root().height() >= 16,
-            "height of node 0 is {}",
-            nodes[0].smr.block_store().unwrap().root().height()
+            nodes[0].smr.block_store().unwrap().root().round() >= 17,
+            "round of node 0 is {}",
+            nodes[0].smr.block_store().unwrap().root().round()
         );
         assert!(
-            nodes[1].smr.block_store().unwrap().root().height() >= 16,
-            "height of node 1 is {}",
-            nodes[1].smr.block_store().unwrap().root().height()
+            nodes[1].smr.block_store().unwrap().root().round() >= 17,
+            "round of node 1 is {}",
+            nodes[1].smr.block_store().unwrap().root().round()
         );
     });
 }
@@ -390,41 +408,39 @@ fn basic_commit_and_restart() {
 #[test]
 fn basic_block_retrieval() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
-    let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    let mut nodes = SMRNode::start_num_nodes(4, &mut playground, FixedProposer, false);
     block_on(async move {
         let mut first_proposals = vec![];
-        // First three proposals are delivered just to nodes[0[ and nodes[1].
-        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+        // First three proposals are delivered just to nodes[0..2].
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
         for _ in 0..2 {
             playground
-                .wait_for_messages(1, NetworkPlayground::proposals_only)
+                .wait_for_messages(2, NetworkPlayground::proposals_only)
                 .await;
-            let mut votes = playground
-                .wait_for_messages(1, NetworkPlayground::votes_only)
+            let votes = playground
+                .wait_for_messages(2, NetworkPlayground::votes_only)
                 .await;
-            let vote_msg = VoteMsg::from_proto(votes[0].1.take_vote()).unwrap();
-            let proposal_id = vote_msg.proposed_block_id();
+            let vote_msg = VoteMsg::try_from(votes[0].1.clone()).unwrap();
+            let proposal_id = vote_msg.vote().vote_data().proposed().id();
             first_proposals.push(proposal_id);
         }
         // The next proposal is delivered to all: as a result nodes[2] should retrieve the missing
         // blocks from nodes[0] and vote for the 3th proposal.
-        playground.stop_drop_message_for(&nodes[0].author, &nodes[2].author);
+        playground.stop_drop_message_for(&nodes[0].signer.author(), &nodes[3].signer.author());
+        // Drop nodes[1]'s vote to ensure nodes[3] contribute to the quorum
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[1].signer.author());
 
         playground
             .wait_for_messages(2, NetworkPlayground::proposals_only)
             .await;
-        // Wait until nodes[2] sent out a vote, drop the vote from nodes[1] so that nodes[0]
-        // won't move too far and prune the requested block
-        playground.drop_message_for(&nodes[1].author, nodes[0].author);
         playground
-            .wait_for_messages(1, NetworkPlayground::votes_only)
+            .wait_for_messages(2, NetworkPlayground::votes_only)
             .await;
-        playground.stop_drop_message_for(&nodes[1].author, &nodes[0].author);
-        // the first two proposals should be present at nodes[2]
+        // The first two proposals should be present at nodes[3] via block retrieval
         for block_id in &first_proposals {
-            assert!(nodes[2]
+            assert!(nodes[3]
                 .smr
                 .block_store()
                 .unwrap()
@@ -432,13 +448,14 @@ fn basic_block_retrieval() {
                 .is_some());
         }
 
-        // Both nodes[1] and nodes[2] are going to vote for 4th proposal and commit the 1th one.
-
-        // Verify that nodes[2] commits the first proposal.
+        // 4th proposal will get quorum and verify that nodes[3] commits the first proposal.
+        playground
+            .wait_for_messages(2, NetworkPlayground::proposals_only)
+            .await;
         playground
             .wait_for_messages(2, NetworkPlayground::votes_only)
             .await;
-        if let Some(commit_v3) = nodes[2].commit_cb_receiver.next().await {
+        if let Some(commit_v3) = nodes[3].commit_cb_receiver.next().await {
             assert_eq!(
                 commit_v3.ledger_info().consensus_block_id(),
                 first_proposals[0],
@@ -450,45 +467,33 @@ fn basic_block_retrieval() {
 #[test]
 fn block_retrieval_with_timeout() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
-    let nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    let nodes = SMRNode::start_num_nodes(4, &mut playground, FixedProposer, false);
     block_on(async move {
         let mut first_proposals = vec![];
-        // First three proposals are delivered just to nodes[0] and nodes[1].
-        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+        // First three proposals are delivered just to nodes[0..2].
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
         for _ in 0..2 {
             playground
-                .wait_for_messages(1, NetworkPlayground::proposals_only)
+                .wait_for_messages(2, NetworkPlayground::proposals_only)
                 .await;
-            let mut votes = playground
-                .wait_for_messages(1, NetworkPlayground::votes_only)
+            let votes = playground
+                .wait_for_messages(2, NetworkPlayground::votes_only)
                 .await;
-            let vote_msg = VoteMsg::from_proto(votes[0].1.take_vote()).unwrap();
-            let proposal_id = vote_msg.proposed_block_id();
+            let vote_msg = VoteMsg::try_from(votes[0].1.clone()).unwrap();
+            let proposal_id = vote_msg.vote().vote_data().proposed().id();
             first_proposals.push(proposal_id);
         }
-        // The next proposal is delivered to all: as a result nodes[2] should retrieve the missing
-        // blocks from v1 and vote for the 4th proposal.
-        playground.stop_drop_message_for(&nodes[0].author, &nodes[2].author);
+        // stop proposals from nodes[0]
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[1].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[2].signer.author());
 
+        // Wait until {1, 2, 3} timeout to {0 , 1, 2, 3} excluding self messages
         playground
-            .wait_for_messages(2, NetworkPlayground::proposals_only)
+            .wait_for_messages(3 * 3, NetworkPlayground::timeout_votes_only)
             .await;
-        playground.drop_message_for(&nodes[1].author, nodes[0].author);
-        // Block RPC and wait until timeout for current round
-        playground.drop_message_for(&nodes[2].author, nodes[0].author);
-        playground
-            .wait_for_messages(1, NetworkPlayground::new_round_only)
-            .await;
-        // Unblock RPC
-        playground.stop_drop_message_for(&nodes[2].author, &nodes[0].author);
-        // Wait until v3 sent out a vote, drop the vote from v2 so that v1 won't move too far
-        // and prune the requested block
-        playground
-            .wait_for_messages(1, NetworkPlayground::votes_only)
-            .await;
-        playground.stop_drop_message_for(&nodes[1].author, &nodes[0].author);
-        // the first two proposals should be present at v3
+
+        // the first two proposals should be present at nodes[3]
         for block_id in &first_proposals {
             assert!(nodes[2]
                 .smr
@@ -505,23 +510,23 @@ fn block_retrieval_with_timeout() {
 /// have been pruned by the others.
 fn basic_state_sync() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
-    let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    let mut nodes = SMRNode::start_num_nodes(4, &mut playground, FixedProposer, false);
     block_on(async move {
         let mut proposals = vec![];
-        // The first ten proposals are delivered just to nodes[0] and nodes[1], which should commit
+        // The first ten proposals are delivered just to nodes[0..2], which should commit
         // the first seven blocks.
-        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
         for _ in 0..10 {
             playground
-                .wait_for_messages(1, NetworkPlayground::proposals_only)
+                .wait_for_messages(2, NetworkPlayground::proposals_only)
                 .await;
-            let mut votes = playground
-                .wait_for_messages(1, NetworkPlayground::votes_only)
+            let votes = playground
+                .wait_for_messages(2, NetworkPlayground::votes_only)
                 .await;
-            let vote_msg = VoteMsg::from_proto(votes[0].1.take_vote()).unwrap();
-            let proposal_id = vote_msg.proposed_block_id();
+            let vote_msg = VoteMsg::try_from(votes[0].1.clone()).unwrap();
+            let proposal_id = vote_msg.vote().vote_data().proposed().id();
             proposals.push(proposal_id);
         }
 
@@ -539,16 +544,16 @@ fn basic_state_sync() {
             assert_eq!(node0_commits[i], proposals[i]);
         }
 
-        // Next proposal is delivered to all: as a result nodes[2] should be able to retrieve the
+        // Next proposal is delivered to all: as a result nodes[3] should be able to retrieve the
         // missing blocks from nodes[0] and commit the first eight proposals as well.
-        playground.stop_drop_message_for(&nodes[0].author, &nodes[2].author);
+        playground.stop_drop_message_for(&nodes[0].signer.author(), &nodes[3].signer.author());
         playground
-            .wait_for_messages(2, NetworkPlayground::proposals_only)
+            .wait_for_messages(3, NetworkPlayground::proposals_only)
             .await;
-        let mut node2_commits = vec![];
+        let mut node3_commits = vec![];
         // The only notification we will receive is for the last (8th) proposal.
-        node2_commits.push(
-            nodes[2]
+        node3_commits.push(
+            nodes[3]
                 .commit_cb_receiver
                 .next()
                 .await
@@ -556,25 +561,22 @@ fn basic_state_sync() {
                 .ledger_info()
                 .consensus_block_id(),
         );
-        assert_eq!(node2_commits[0], proposals[7]);
+        assert_eq!(node3_commits[0], proposals[7]);
 
-        // wait for the vote from node2
+        // wait for the vote from all including node3
         playground
-            .wait_for_messages(1, NetworkPlayground::votes_only)
+            .wait_for_messages(3, NetworkPlayground::votes_only)
             .await;
-        for (_, proposal) in playground
-            .wait_for_messages(2, NetworkPlayground::proposals_only)
-            .await
-        {
-            assert_eq!(proposal.has_proposal(), true);
-        }
-        // Verify that node 2 has notified its mempool about the committed txn of next block.
-        nodes[2]
+        playground
+            .wait_for_messages(3, NetworkPlayground::proposals_only)
+            .await;
+        // Verify that node 3 has notified its mempool about the committed txn of next block.
+        nodes[3]
             .mempool_notif_receiver
             .next()
             .await
             .expect("Fail to be notified by a mempool committed txns");
-        assert_eq!(nodes[2].mempool.get_committed_txns().len(), 50);
+        assert_eq!(nodes[3].mempool.get_committed_txns().len(), 50);
     });
 }
 
@@ -582,49 +584,321 @@ fn basic_state_sync() {
 /// Verify that a node syncs up when receiving a timeout message with a relevant ledger info
 fn state_sync_on_timeout() {
     let runtime = consensus_runtime();
-    let mut playground = NetworkPlayground::new(runtime.executor());
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
     // This test depends on the fixed proposer on nodes[0]
-    let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    let mut nodes = SMRNode::start_num_nodes(4, &mut playground, FixedProposer, false);
     block_on(async move {
-        let mut proposals = vec![];
-        // The first ten proposals are delivered just to nodes[0] and nodes[1], which should commit
+        // The first ten proposals are delivered just to nodes[0..2], which should commit
         // the first seven blocks.
-        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+        // nodes[2] should be fully disconnected from the others s.t. its timeouts would not trigger
+        // SyncInfo delivery ahead of time.
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
+        playground.drop_message_for(&nodes[1].signer.author(), nodes[3].signer.author());
+        playground.drop_message_for(&nodes[2].signer.author(), nodes[3].signer.author());
         for _ in 0..10 {
             playground
-                .wait_for_messages(1, NetworkPlayground::proposals_only)
+                .wait_for_messages(2, NetworkPlayground::proposals_only)
                 .await;
-            let mut votes = playground
-                .wait_for_messages(1, NetworkPlayground::votes_only)
+            playground
+                .wait_for_messages(2, NetworkPlayground::votes_only)
                 .await;
-            let vote_msg = VoteMsg::from_proto(votes[0].1.take_vote()).unwrap();
-            let proposal_id = vote_msg.proposed_block_id();
-            proposals.push(proposal_id);
         }
 
-        // Start dropping messages from 0 to 1 as well: node 0 is now disconnected and we can
-        // expect timeouts from both 0 and 1.
-        playground.drop_message_for(&nodes[0].author, nodes[1].author);
-
-        // Wait for a timeout message from 2 to {0, 1} and from 1 to {0, 2}
-        // (node 0 cannot send to anyone).  Note that there are 6 messages waited on
-        // since 2 can timeout 2x while waiting for 1 to timeout.
+        // Stop dropping messages from node 1 to node 0: next time node 0 sends a timeout to node 1,
+        // node 1 responds with a SyncInfo that carries a LedgerInfo for commit at round >= 7.
+        playground.stop_drop_message_for(&nodes[1].signer.author(), &nodes[3].signer.author());
+        // Wait for the sync info message from 1 to 3
         playground
-            .wait_for_messages(6, NetworkPlayground::new_round_only)
+            .wait_for_messages(1, NetworkPlayground::sync_info_only)
             .await;
-
-        let mut node2_commits = vec![];
-        // The only notification we will receive is for the last commit known to nodes[1]: 7th
-        // proposal.
-        node2_commits.push(
-            nodes[2]
+        // In the end of the state synchronization node 3 should have commit at round >= 7.
+        assert!(
+            nodes[3]
                 .commit_cb_receiver
                 .next()
                 .await
                 .unwrap()
                 .ledger_info()
-                .consensus_block_id(),
+                .round()
+                >= 7
         );
-        assert_eq!(node2_commits[0], proposals[6]);
+    });
+}
+
+#[test]
+/// Verify that in case a node receives timeout message from a remote peer that is lagging behind,
+/// then this node sends a sync info, which helps the remote to properly catch up.
+fn sync_info_sent_if_remote_stale() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+    // This test depends on the fixed proposer on nodes[0]
+    // We're going to drop messages from 0 to 2: as a result we expect node 2 to broadcast timeout
+    // messages, for which node 1 should respond with sync_info, which should eventually
+    // help node 2 to catch up.
+    let mut nodes = SMRNode::start_num_nodes(4, &mut playground, FixedProposer, false);
+    block_on(async move {
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[2].signer.author());
+        // Don't want to receive timeout messages from 2 until 1 has some real stuff to contribute.
+        playground.drop_message_for(&nodes[2].signer.author(), nodes[1].signer.author());
+        for _ in 0..10 {
+            playground
+                .wait_for_messages(2, NetworkPlayground::proposals_only)
+                .await;
+            playground
+                .wait_for_messages(2, NetworkPlayground::votes_only)
+                .await;
+        }
+
+        // Wait for some timeout message from 2 to {0, 1}.
+        playground.stop_drop_message_for(&nodes[2].signer.author(), &nodes[1].signer.author());
+        playground
+            .wait_for_messages(3, NetworkPlayground::timeout_votes_only)
+            .await;
+        // Now wait for a sync info message from 1 to 2.
+        playground
+            .wait_for_messages(1, NetworkPlayground::sync_info_only)
+            .await;
+
+        let node2_commit = nodes[2]
+            .commit_cb_receiver
+            .next()
+            .await
+            .unwrap()
+            .ledger_info()
+            .consensus_block_id();
+
+        // Close node 1 channel for new commit callbacks and iterate over all its commits: we should
+        // find the node 2 commit there.
+        let mut found = false;
+        nodes[1].commit_cb_receiver.close();
+        while let Ok(Some(node1_commit)) = nodes[1].commit_cb_receiver.try_next() {
+            let node1_commit_id = node1_commit.ledger_info().consensus_block_id();
+            if node1_commit_id == node2_commit {
+                found = true;
+                break;
+            }
+        }
+
+        assert_eq!(found, true);
+    });
+}
+
+#[test]
+/// Verify that a QC can be formed by aggregating the votes piggybacked by TimeoutMsgs
+fn aggregate_timeout_votes() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+
+    // The proposer node[0] sends its proposal to nodes 1 and 2, which cannot respond back,
+    // because their messages are dropped.
+    // Upon timeout nodes 1 and 2 are sending timeout messages with attached votes for the original
+    // proposal: both can then aggregate the QC for the first proposal.
+    let nodes = SMRNode::start_num_nodes(3, &mut playground, FixedProposer, false);
+    block_on(async move {
+        // Nodes 1 and 2 cannot send messages to anyone
+        playground.drop_message_for(&nodes[1].signer.author(), nodes[0].signer.author());
+        playground.drop_message_for(&nodes[2].signer.author(), nodes[0].signer.author());
+        playground.drop_message_for(&nodes[1].signer.author(), nodes[2].signer.author());
+        playground.drop_message_for(&nodes[2].signer.author(), nodes[1].signer.author());
+
+        // Node 0 sends proposals to nodes 1 and 2
+        let msg = playground
+            .wait_for_messages(2, NetworkPlayground::proposals_only)
+            .await;
+        let first_proposal: ProposalMsg<Vec<u64>> =
+            ProposalUncheckedSignatures::<Vec<u64>>::try_from(msg[0].1.clone())
+                .unwrap()
+                .into();
+        let proposal_id = first_proposal.proposal().id();
+        // wait for node 0 send vote to 1 and 2
+        playground
+            .wait_for_messages(2, NetworkPlayground::votes_only)
+            .await;
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[1].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[2].signer.author());
+
+        // Now when the nodes 1 and 2 have the votes from 0, enable communication between them.
+        // As a result they should get the votes from each other and thus be able to form a QC.
+        playground.stop_drop_message_for(&nodes[2].signer.author(), &nodes[1].signer.author());
+        playground.stop_drop_message_for(&nodes[1].signer.author(), &nodes[2].signer.author());
+
+        // Wait for the timeout messages sent by 1 and 2 to each other
+        playground
+            .wait_for_messages(2, NetworkPlayground::timeout_votes_only)
+            .await;
+
+        // Node 0 cannot form a QC
+        assert_eq!(
+            nodes[0]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block()
+                .round(),
+            0
+        );
+        // Nodes 1 and 2 form a QC and move to the next round.
+        // Wait for the timeout messages from 1 and 2
+        playground
+            .wait_for_messages(2, NetworkPlayground::timeout_votes_only)
+            .await;
+
+        assert_eq!(
+            nodes[1]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block()
+                .id(),
+            proposal_id
+        );
+        assert_eq!(
+            nodes[2]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block()
+                .id(),
+            proposal_id
+        );
+    });
+}
+
+#[test]
+/// Verify that the NIL blocks formed during timeouts can be used to form commit chains.
+fn chain_with_nil_blocks() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+
+    // The proposer node[0] sends 3 proposals, after that its proposals are dropped and it cannot
+    // communicate with nodes 1, 2, 3. Nodes 1, 2, 3 should be able to commit the 3 proposal
+    // via NIL blocks commit chain.
+    let num_nodes = 4;
+    let nodes = SMRNode::start_num_nodes(num_nodes, &mut playground, FixedProposer, false);
+    let num_proposal = 3;
+    block_on(async move {
+        // Wait for the first 3 proposals (each one sent to two nodes).
+        playground
+            .wait_for_messages(
+                (num_nodes - 1) * num_proposal,
+                NetworkPlayground::proposals_only,
+            )
+            .await;
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[1].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[2].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
+
+        // After the first timeout nodes 1, 2, 3 should have last_proposal votes and
+        // they can generate its QC independently.
+        // Upon the second timeout nodes 1, 2, 3 send NIL block_1 with a QC to last_proposal.
+        // Upon the third timeout nodes 1, 2, 3 send NIL block_2 with a QC to NIL block_1.
+        // G <- p1 <- p2 <- p3 <- NIL1 <- NIL2
+        let num_timeout = 3;
+        playground
+            .wait_for_messages(
+                // all-to-all broadcast except nodes 0's messages are dropped and self messages don't count
+                (num_nodes - 1) * (num_nodes - 1) * num_timeout,
+                NetworkPlayground::timeout_votes_only,
+            )
+            .await;
+        // We can't guarantee the timing of the last timeout processing, the only thing we can
+        // look at is that HQC round is at least 4.
+        assert!(
+            nodes[2]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block()
+                .round()
+                >= 4
+        );
+
+        assert!(nodes[2].smr.block_store().unwrap().root().round() >= 1)
+    });
+}
+
+#[test]
+/// Test secondary proposal processing
+fn secondary_proposers() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+
+    let num_nodes = 4;
+    let mut nodes =
+        SMRNode::start_num_nodes(num_nodes, &mut playground, MultipleOrderedProposers, false);
+    block_on(async move {
+        // Node 0 is disconnected.
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[1].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[2].signer.author());
+        playground.drop_message_for(&nodes[0].signer.author(), nodes[3].signer.author());
+        // Run a system until node 0 is a designated primary proposer. In this round the
+        // secondary proposal should be voted for and attached to the timeout message.
+        let timeout_votes = playground
+            .wait_for_messages(
+                (num_nodes - 1) * (num_nodes - 1),
+                NetworkPlayground::timeout_votes_only,
+            )
+            .await;
+        let mut secondary_proposal_ids = vec![];
+        for msg in timeout_votes {
+            let vote_msg = VoteMsg::try_from(msg.1).unwrap();
+            assert!(vote_msg.vote().is_timeout());
+            secondary_proposal_ids.push(vote_msg.vote().vote_data().proposed().id());
+        }
+        assert_eq!(
+            secondary_proposal_ids.len(),
+            (num_nodes - 1) * (num_nodes - 1)
+        );
+        let secondary_proposal_id = secondary_proposal_ids[0];
+        for id in secondary_proposal_ids {
+            assert_eq!(secondary_proposal_id, id);
+        }
+        // The secondary proposal id should get committed at some point in the future:
+        // 10 rounds should be more than enough. Note that it's hard to say what round is going to
+        // have 2 proposals and what round is going to have just one proposal because we don't want
+        // to predict the rounds with proposer 0 being a leader.
+        for _ in 0..10 {
+            playground
+                .wait_for_messages(num_nodes - 1, NetworkPlayground::votes_only)
+                .await;
+            // Retrieve all the ids committed by the node to check whether secondary_proposal_id
+            // has been committed.
+            while let Ok(Some(li)) = nodes[1].commit_cb_receiver.try_next() {
+                if li.ledger_info().consensus_block_id() == secondary_proposal_id {
+                    return;
+                }
+            }
+        }
+        panic!("Did not commit the secondary proposal");
+    });
+}
+
+#[test]
+/// Test we can do reconfiguration if execution returns new validator set.
+fn reconfiguration_test() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.handle().clone());
+
+    // This quorum size needs to be 2f+1 because we derive the ValidatorVerifier from ValidatorSet at network.rs
+    // which doesn't support specializing quorum power
+    let _nodes = SMRNode::start_num_nodes(4, &mut playground, MultipleOrderedProposers, true);
+    let target_epoch = 10;
+    block_on(async move {
+        // Test we can survive a few epochs
+        loop {
+            let mut msg = playground
+                .wait_for_messages(1, NetworkPlayground::take_all)
+                .await;
+            if let Some(ConsensusMsg_oneof::EpochChange(proof)) = msg.pop().unwrap().1.message {
+                let proof = ValidatorChangeProof::try_from(proof).unwrap();
+                if proof.epoch().unwrap() == target_epoch {
+                    break;
+                }
+            }
+        }
     });
 }

@@ -10,4 +10,4 @@ main() {
     return;
 }
 
-// check: VerificationError { kind: FunctionDefinition, idx: 0, err: WriteRefNoMutableReferenceError(9) }
+// check: WRITEREF_NO_MUTABLE_REFERENCE_ERROR

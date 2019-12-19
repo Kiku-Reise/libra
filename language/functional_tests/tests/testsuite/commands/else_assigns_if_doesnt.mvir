@@ -10,4 +10,6 @@ main() {
     return;
 }
 
-// check: VerificationError { kind: FunctionDefinition, idx: 0, err: CopyLocUnavailableError(8) }
+// TODO: duplicated errors
+// check: COPYLOC_UNAVAILABLE_ERROR
+// check: COPYLOC_UNAVAILABLE_ERROR

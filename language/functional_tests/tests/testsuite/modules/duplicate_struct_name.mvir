@@ -1,12 +1,6 @@
-// check: VerificationError { kind: StructDefinition, idx: 1, err: DuplicateElement }
+// check: DUPLICATE_ELEMENT
 
-modules:
 module M {
-    struct T{}
-    struct T{}
-}
-
-script:
-main() {
-    return;
+    struct T{b: bool}
+    struct T{x: u64}
 }

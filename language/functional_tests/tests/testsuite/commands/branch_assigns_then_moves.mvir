@@ -13,5 +13,4 @@ main() {
     return;
 }
 
-// check: VerificationError
-// check: CopyLocUnavailableError
+// check: COPYLOC_UNAVAILABLE_ERROR

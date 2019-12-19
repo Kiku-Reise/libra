@@ -1,16 +1,17 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use config::config::NodeConfig;
-use failure::prelude::*;
+use anyhow::Result;
+use libra_config::config::NodeConfig;
 use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
 
 use crate::chained_bft::chained_bft_consensus_provider::ChainedBftProvider;
-use execution_proto::proto::execution_grpc::ExecutionClient;
-use grpcio::{ChannelBuilder, EnvBuilder};
-use mempool::proto::mempool_grpc::MempoolClient;
+use executor::Executor;
+use grpcio::EnvBuilder;
+use state_synchronizer::StateSyncClient;
 use std::sync::Arc;
 use storage_client::{StorageRead, StorageReadServiceClient};
+use vm_runtime::LibraVM;
 
 /// Public interface to a consensus protocol.
 pub trait ConsensusProvider {
@@ -27,36 +28,18 @@ pub trait ConsensusProvider {
 
 /// Helper function to create a ConsensusProvider based on configuration
 pub fn make_consensus_provider(
-    node_config: &NodeConfig,
+    node_config: &mut NodeConfig,
     network_sender: ConsensusNetworkSender,
     network_receiver: ConsensusNetworkEvents,
+    executor: Arc<Executor<LibraVM>>,
+    state_sync_client: Arc<StateSyncClient>,
 ) -> Box<dyn ConsensusProvider> {
     Box::new(ChainedBftProvider::new(
         node_config,
         network_sender,
         network_receiver,
-        create_mempool_client(node_config),
-        create_execution_client(node_config),
-    ))
-}
-/// Create a mempool client assuming the mempool is running on localhost
-fn create_mempool_client(config: &NodeConfig) -> Arc<MempoolClient> {
-    let port = config.mempool.mempool_service_port;
-    let connection_str = format!("localhost:{}", port);
-
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-mem-").build());
-    Arc::new(MempoolClient::new(
-        ChannelBuilder::new(env).connect(&connection_str),
-    ))
-}
-
-/// Create an execution client assuming the mempool is running on localhost
-fn create_execution_client(config: &NodeConfig) -> Arc<ExecutionClient> {
-    let connection_str = format!("localhost:{}", config.execution.port);
-
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-exe-").build());
-    Arc::new(ExecutionClient::new(
-        ChannelBuilder::new(env).connect(&connection_str),
+        executor,
+        state_sync_client,
     ))
 }
 

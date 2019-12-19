@@ -11,4 +11,4 @@ main() {
     return;
 }
 
-// check: VerificationError { kind: FunctionDefinition, idx: 0, err: MoveLocUnavailableError(8) }
+// check: MOVELOC_UNAVAILABLE_ERROR
